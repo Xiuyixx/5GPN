@@ -290,11 +290,11 @@ get_public_ip() {
 
 check_port_53() {
     info "Checking port 53 availability..."
-    local pid
-    pid=$(find_port53_pid)
+    local pids pid proc confirm
+    pids=$(find_port53_pids)
 
-    if [[ -n "$pid" ]]; then
-        local proc
+    if [[ -n "$pids" ]]; then
+        pid=$(echo "$pids" | head -n1)
         proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
         warn "Port 53 is already in use by: $proc (PID: $pid)"
 
@@ -304,12 +304,15 @@ check_port_53() {
             exit 1
         fi
 
-        stop_port53_owner "$pid" "$proc"
-        sleep 1
+        while read -r pid; do
+            [[ -z "$pid" ]] && continue
+            proc=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            stop_port53_owner "$pid" "$proc"
+        done <<< "$pids"
 
-        # Double check
-        pid=$(find_port53_pid)
-        if [[ -n "$pid" ]]; then
+        if ! wait_for_port53_free; then
+            warn "Port 53 is still in use after stopping services. Last listeners:"
+            list_port53_listeners >&2 || true
             err "Failed to free port 53. Please manually stop the service using it."
             exit 1
         fi
@@ -325,20 +328,21 @@ systemd_unit_for_pid() {
     grep -aoE '[^/]+\.service' "/proc/$pid/cgroup" | head -n1 || true
 }
 
-find_port53_pid() {
+find_port53_pids() {
     if command -v ss >/dev/null 2>&1; then
         ss -H -lnptu 2>/dev/null | awk '
             $5 ~ /(^|\]|:)53$/ || $5 ~ /:53$/ {
-                if (match($0, /pid=[0-9]+/)) {
-                    print substr($0, RSTART + 4, RLENGTH - 4)
-                    exit
+                line=$0
+                while (match(line, /pid=[0-9]+/)) {
+                    print substr(line, RSTART + 4, RLENGTH - 4)
+                    line=substr(line, RSTART + RLENGTH)
                 }
-            }'
+            }' | sort -u
         return 0
     fi
 
     if command -v lsof >/dev/null 2>&1; then
-        lsof -nP -iTCP:53 -iUDP:53 -sTCP:LISTEN -t 2>/dev/null | head -n1
+        lsof -nP -iTCP:53 -iUDP:53 -sTCP:LISTEN -t 2>/dev/null | sort -u
         return 0
     fi
 
@@ -348,13 +352,33 @@ find_port53_pid() {
                 split($7, p, "/")
                 if (p[1] ~ /^[0-9]+$/) {
                     print p[1]
-                    exit
                 }
-            }'
+            }' | sort -u
         return 0
     fi
 
     return 0
+}
+
+wait_for_port53_free() {
+    local i
+    for i in $(seq 1 15); do
+        if [[ -z "$(find_port53_pids)" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+list_port53_listeners() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnptu 2>/dev/null | awk 'NR == 1 || $5 ~ /(^|\]|:)53$/ || $5 ~ /:53$/ {print}'
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:53 -iUDP:53 -sTCP:LISTEN 2>/dev/null || true
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -lnptu 2>/dev/null | awk 'NR <= 2 || $4 ~ /(^|\]|:)53$/ || $4 ~ /:53$/ {print}'
+    fi
 }
 
 ensure_system_dns() {
@@ -401,6 +425,13 @@ stop_port53_owner() {
                 systemctl disable systemd-resolved.service 2>/dev/null || true
             fi
             ;;
+        dnsdist)
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl stop dnsdist.socket dnsdist.service 2>/dev/null || true
+                systemctl disable dnsdist.socket dnsdist.service 2>/dev/null || true
+                systemctl reset-failed dnsdist.socket dnsdist.service 2>/dev/null || true
+            fi
+            ;;
         dnsmasq)
             if command -v systemctl >/dev/null 2>&1; then
                 systemctl stop dnsmasq.service 2>/dev/null || true
@@ -417,6 +448,10 @@ stop_port53_owner() {
 
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
         kill "$pid" 2>/dev/null || true
+        sleep 1
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
     fi
 }
 

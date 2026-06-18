@@ -5,7 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 install="${root}/install.sh"
 install_body="$(cat "${install}")"
 
-if [[ "${install_body}" != *'find_port53_pid()'* ]]; then
+if [[ "${install_body}" != *'find_port53_pids()'* ]]; then
     echo "install.sh must detect port 53 without hard requiring ss before dependencies are installed." >&2
     exit 1
 fi
