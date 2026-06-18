@@ -466,28 +466,28 @@ install_deps() {
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq
             apt-get install -y -qq \
-                build-essential git wget curl ca-certificates \
+                build-essential wget curl ca-certificates \
                 iproute2 procps lsof net-tools \
                 libev-dev libssl-dev \
                 autoconf automake libtool pkg-config \
                 dnsdist certbot \
                 python3 python3-pip jq libcap2-bin \
                 nftables qrencode
-            apt-get install -y -qq python3-certbot-dns-cloudflare 2>/dev/null || true
+            apt-get install -y -qq git python3-certbot-dns-cloudflare 2>/dev/null || true
             apt-get install -y -qq libpcre3-dev 2>/dev/null || \
                 apt-get install -y -qq libpcre2-dev 2>/dev/null || true
             apt-get install -y -qq libudns-dev 2>/dev/null || true
             ;;
         dnf|yum)
             $PKG_MGR install -y -q \
-                gcc gcc-c++ make git wget curl ca-certificates \
+                gcc gcc-c++ make wget curl ca-certificates \
                 iproute procps-ng lsof net-tools \
                 libev-devel pcre-devel openssl-devel \
                 autoconf automake libtool pkgconfig \
                 dnsdist certbot \
                 python3 python3-pip jq libcap-ng-utils \
                 nftables qrencode
-            $PKG_MGR install -y -q python3-certbot-dns-cloudflare 2>/dev/null || true
+            $PKG_MGR install -y -q git python3-certbot-dns-cloudflare 2>/dev/null || true
             ;;
     esac
 
@@ -773,11 +773,28 @@ install_cert() {
 # =============================================================================
 install_sniproxy() {
     if ! command -v sniproxy >/dev/null 2>&1; then
-        info "Compiling sniproxy (TCP SNI proxy)..."
+        info "Installing sniproxy (TCP SNI proxy)..."
+        case "$PKG_MGR" in
+            apt-get)
+                apt-get install -y -qq sniproxy 2>/dev/null || true
+                ;;
+            dnf|yum)
+                $PKG_MGR install -y -q sniproxy 2>/dev/null || true
+                ;;
+        esac
+    fi
+
+    if ! command -v sniproxy >/dev/null 2>&1; then
+        info "Compiling sniproxy from source..."
         mkdir -p "$SRC_DIR"
         cd "$SRC_DIR"
 
         if [[ ! -d sniproxy ]]; then
+            if ! command -v git >/dev/null 2>&1; then
+                err "sniproxy package is unavailable and git is not installed for source build."
+                err "Install sniproxy manually or install git, then rerun this script."
+                exit 1
+            fi
             git clone --depth=1 https://github.com/dlundquist/sniproxy.git
         fi
         cd sniproxy
