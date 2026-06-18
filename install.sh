@@ -692,47 +692,68 @@ register_domain_cloudns() {
     touch "${CONF_DIR}/.domain_registered"
 }
 
+
+copy_dnsdist_cert() {
+    local cert_domain="${1:-$DOMAIN}"
+    local cert_live_dir="/etc/letsencrypt/live/${cert_domain}"
+
+    if [[ ! -f "${cert_live_dir}/fullchain.pem" || ! -f "${cert_live_dir}/privkey.pem" ]]; then
+        return 1
+    fi
+
+    info "Copying certificates to /etc/dnsdist/certs/ ..."
+    mkdir -p /etc/dnsdist/certs
+    cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
+    cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
+    if getent passwd _dnsdist >/dev/null 2>&1 && getent group _dnsdist >/dev/null 2>&1; then
+        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
+    elif getent passwd dnsdist >/dev/null 2>&1 && getent group dnsdist >/dev/null 2>&1; then
+        chown -R dnsdist:dnsdist /etc/dnsdist/certs/
+    else
+        warn "dnsdist user not found yet; leaving certificate ownership as root"
+    fi
+    chmod 640 /etc/dnsdist/certs/*.pem
+    ok "Certificates copied to /etc/dnsdist/certs/"
+}
+
 # =============================================================================
 # Let's Encrypt Certificate
 # =============================================================================
 install_cert() {
-    local certbot_cmd certbot_cmd_force
+    local certbot_cmd
     install_certbot_firewall_hooks
+
+    if copy_dnsdist_cert "$DOMAIN"; then
+        info "Existing Let's Encrypt certificate found for $DOMAIN; reusing it for installation."
+        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+        cp "${SCRIPT_DIR}/renew-hook.sh" /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
+        chmod +x /etc/letsencrypt/renewal-hooks/deploy/99-reload-dnsdist.sh
+        ok "证书已就绪，自动续期 Hook 已部署"
+        return 0
+    fi
 
     # Normal issuance (first time) - no force-renewal to avoid rate limits
     certbot_cmd=(certbot certonly --standalone -d "$DOMAIN" \
         --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
         --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
         --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
-    # Reinstall / explicit renew - force renewal
-    certbot_cmd_force=(certbot certonly --standalone -d "$DOMAIN" --force-renewal \
-        --agree-tos -n -m "${EMAIL:-admin@${DOMAIN}}" \
-        --pre-hook /usr/local/bin/proxy-gateway-open-cert-http.sh \
-        --post-hook /usr/local/bin/proxy-gateway-restore-firewall.sh)
 
-    local cb_cmd=()
-    if [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
-        info "Let's Encrypt certificate already exists for $DOMAIN, forcing renewal..."
-        cb_cmd=("${certbot_cmd_force[@]}")
-    else
-        info "申请 Let's Encrypt 证书 for $DOMAIN..."
-        cb_cmd=("${certbot_cmd[@]}")
-    fi
+    info "申请 Let's Encrypt 证书 for $DOMAIN..."
 
     run_certbot() {
         open_cert_http_port
         trap restore_reverse_proxy_firewall RETURN
-        if "${cb_cmd[@]}"; then
+        if "${certbot_cmd[@]}"; then
             return 0
         fi
         # Check for known Python compatibility error
-        if "${cb_cmd[@]}" 2>&1 | grep -q "AttributeError" || \
+        if "${certbot_cmd[@]}" 2>&1 | grep -q "AttributeError" || \
            certbot --version 2>&1 | grep -q "AttributeError"; then
             warn "Certbot compatibility error detected. Attempting to fix Python dependencies..."
             pip3 install --upgrade --break-system-packages certbot josepy cryptography 2>/dev/null || \
                 pip3 install --upgrade certbot josepy cryptography 2>/dev/null || true
             info "Retrying certificate request..."
-            "${cb_cmd[@]}"
+            "${certbot_cmd[@]}"
         else
             return 1
         fi
@@ -743,22 +764,13 @@ install_cert() {
         err "  1. 域名 $DOMAIN 是否正确解析到本机 ($PUBLIC_IP)"
         err "  2. 端口 80 是否被占用"
         err "  3. 防火墙是否放行 80"
-        err "  4. 是否触发了 Let's Encrypt 速率限制 (同一域名 7 天内限 5 次)"
+        err "  4. Let's Encrypt ACME 服务是否临时不可用 (HTTP 503)"
+        err "  5. 是否触发了 Let's Encrypt 速率限制"
         exit 1
     fi
 
-    # Copy certificates to dnsdist-readable location
-    info "Copying certificates to /etc/dnsdist/certs/ ..."
-    local cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
-    if [[ -d "$cert_live_dir" ]]; then
-        mkdir -p /etc/dnsdist/certs
-        cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
-        cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
-        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
-        chmod 640 /etc/dnsdist/certs/*.pem
-        ok "Certificates copied to /etc/dnsdist/certs/"
-    else
-        warn "Could not find certificate live directory: $cert_live_dir"
+    if ! copy_dnsdist_cert "$DOMAIN"; then
+        warn "Could not find issued certificate live directory for $DOMAIN"
     fi
 
     # Deploy renewal hook (also handles cert copy on renewal)
@@ -1471,11 +1483,7 @@ force_renew_cert() {
     # Re-copy certificates to dnsdist-readable location
     local cert_live_dir="/etc/letsencrypt/live/${DOMAIN}"
     if [[ -d "$cert_live_dir" ]]; then
-        mkdir -p /etc/dnsdist/certs
-        cp "${cert_live_dir}/fullchain.pem" /etc/dnsdist/certs/fullchain.pem
-        cp "${cert_live_dir}/privkey.pem" /etc/dnsdist/certs/privkey.pem
-        chown -R _dnsdist:_dnsdist /etc/dnsdist/certs/
-        chmod 640 /etc/dnsdist/certs/*.pem
+        copy_dnsdist_cert "$DOMAIN"
     fi
 
     if systemctl is-active --quiet dnsdist; then
