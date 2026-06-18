@@ -141,6 +141,20 @@ configure_overseas_dns() {
 }
 
 
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --retry 2 --retry-delay 1 "$url" -o "$output"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=10 --tries=2 -O "$output" "$url"
+    else
+        err "curl or wget is required for one-line remote install."
+        exit 1
+    fi
+}
+
 bootstrap_remote_project() {
     local missing=0
     local file
@@ -155,28 +169,38 @@ bootstrap_remote_project() {
     [[ "$missing" == "0" ]] && return 0
 
     info "Detected one-line remote install mode; downloading full ${REPO_OWNER}/${REPO_NAME} project..."
-    local workdir archive_url archive_file extracted_dir
+    local workdir archive_file extracted_dir archive_url
     workdir=$(mktemp -d /tmp/5gpn-install.XXXXXX)
-    archive_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
     archive_file="${workdir}/${REPO_NAME}.tar.gz"
 
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$archive_url" -o "$archive_file"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$archive_file" "$archive_url"
-    else
-        err "curl or wget is required for one-line remote install."
-        exit 1
-    fi
+    local archive_urls=(
+        "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/${REPO_BRANCH}"
+        "https://github.com/${REPO_OWNER}/${REPO_NAME}/archive/refs/heads/${REPO_BRANCH}.tar.gz"
+    )
 
-    tar -xzf "$archive_file" -C "$workdir"
-    extracted_dir=$(find "$workdir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n1)
-    if [[ -z "$extracted_dir" || ! -f "${extracted_dir}/install.sh" ]]; then
-        err "Failed to extract ${REPO_OWNER}/${REPO_NAME} project archive."
-        exit 1
-    fi
+    for archive_url in "${archive_urls[@]}"; do
+        if download_file "$archive_url" "$archive_file"; then
+            if tar -xzf "$archive_file" -C "$workdir" 2>/dev/null; then
+                extracted_dir=$(find "$workdir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -n1)
+                if [[ -n "$extracted_dir" && -f "${extracted_dir}/install.sh" ]]; then
+                    chmod +x "${extracted_dir}/install.sh"
+                    info "Continuing installation from ${extracted_dir}"
+                    cd "$extracted_dir"
+                    exec bash "${extracted_dir}/install.sh" "$@"
+                fi
+            fi
+        fi
+        warn "Unable to download project archive from ${archive_url}; trying next source..."
+    done
 
-    chmod +x "${extracted_dir}/install.sh"
+    warn "Archive download failed; falling back to raw.githubusercontent.com file download."
+    extracted_dir="${workdir}/${REPO_NAME}"
+    mkdir -p "${extracted_dir}/tests"
+    download_file "${REPO_RAW_BASE}/install.sh" "${extracted_dir}/install.sh"
+    for file in "${REQUIRED_PROJECT_FILES[@]}"; do
+        download_file "${REPO_RAW_BASE}/${file}" "${extracted_dir}/${file}"
+    done
+    chmod +x "${extracted_dir}/install.sh" "${extracted_dir}/update-rules.sh" "${extracted_dir}/renew-hook.sh"
     info "Continuing installation from ${extracted_dir}"
     cd "$extracted_dir"
     exec bash "${extracted_dir}/install.sh" "$@"
